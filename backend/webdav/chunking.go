@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/readers"
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -34,10 +35,16 @@ func (f *Fs) shouldRetryChunkMerge(ctx context.Context, resp *http.Response, err
 	// 423 LOCKED
 	if resp != nil && resp.StatusCode == 423 {
 		*wasLocked = true
-		fs.Logf(f, "Sleeping for %v to wait for chunks to be merged after 423 error", *sleepTime)
-		time.Sleep(*sleepTime)
+		sleep := *sleepTime
+		// Increase the wait on the next attempt so the server has longer
+		// to finish merging the chunks before giving up.
 		*sleepTime *= 2
-		return true, fmt.Errorf("merging the uploaded chunks failed with 423 LOCKED. This usually happens when the chunks merging is still in progress on NextCloud, but it may also indicate a failed transfer: %w", err)
+		// Hand the wait to the pacer rather than blocking here, so that
+		// RetryAfter is honoured by the calculator, the retry budget
+		// (--low-level-retries) is respected and the goroutine is not held
+		// hostage while other work could proceed.
+		fs.Logf(f, "Waiting %v for chunks to be merged after 423 error", sleep)
+		return true, pacer.RetryAfterError(fmt.Errorf("merging the uploaded chunks failed with 423 LOCKED. This usually happens when the chunks merging is still in progress on NextCloud, but it may also indicate a failed transfer: %w", err), sleep)
 	}
 
 	return f.shouldRetry(ctx, resp, err)
