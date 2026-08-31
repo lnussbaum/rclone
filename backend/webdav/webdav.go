@@ -641,6 +641,9 @@ var nextCloudURLRegex = regexp.MustCompile(`^(.*)/dav/files/([^/]+)`)
 
 // setQuirks adjusts the Fs for the vendor passed in
 func (f *Fs) setQuirks(ctx context.Context, vendor string) error {
+	// Only the nextcloud vendor supports the chunked upload protocol, so
+	// disable the parallel (multi-thread) chunk writer everywhere else.
+	f.features.OpenChunkWriter = nil
 	switch vendor {
 	case "fastmail":
 		f.canStream = true
@@ -680,6 +683,10 @@ func (f *Fs) setQuirks(ctx context.Context, vendor string) error {
 			}
 
 			f.chunksUploadURL = chunksUploadURL
+			// Enable parallel (multi-thread) chunked uploads. rclone's
+			// multi-thread copy machinery uploads the chunks concurrently
+			// and then calls Close to assemble them.
+			f.features.OpenChunkWriter = f.OpenChunkWriter
 			fs.Debugf(nil, "Chunks temporary upload directory: %s", f.chunksUploadURL)
 		}
 	case "sharepoint":
