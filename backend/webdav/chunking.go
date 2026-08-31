@@ -6,6 +6,7 @@ package webdav
 */
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -203,6 +204,168 @@ func (o *Object) mergeChunks(ctx context.Context, uploadDir string, options []fs
 	}
 	return err
 }
+
+// chunkWriter uploads the chunks of a file to the Nextcloud chunked
+// upload directory in parallel then assembles them with a MOVE.
+type chunkWriter struct {
+	fs           *Fs
+	filePath     string             // final destination below the webdav root
+	uploadDir    string             // chunked upload directory
+	chunkSize    int64              // size of each chunk
+	extraHeaders map[string]string  // headers to apply to the merge request
+	options      []fs.OpenOption    // open options
+}
+
+// WriteChunk writes the chunk number to the Nextcloud chunked upload
+// directory. reader contains exactly the bytes of chunk <chunkNumber>
+// (already ranged by the multi-thread copy machinery).
+func (w *chunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
+	if chunkNumber < 0 {
+		return -1, fmt.Errorf("invalid chunk number provided: %v", chunkNumber)
+	}
+	// The reader is a ReadSeeker whose current position gives the chunk
+	// contents. Determine where this chunk belongs so the server can sort
+	// the chunks before assembling them (v1 chunking protocol uses byte
+	// offset based names).
+	offset := int64(chunkNumber) * w.chunkSize
+
+	// Read the whole chunk to learn its real size (the last chunk may be
+	// smaller than the configured chunk size).
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return -1, fmt.Errorf("failed to read chunk %d: %w", chunkNumber, err)
+	}
+	contentLength := int64(len(data))
+	if contentLength == 0 {
+		// nothing to upload for an empty chunk
+		return 0, nil
+	}
+	endOffset := offset + contentLength - 1
+
+	partRemote := fmt.Sprintf("%s/%015d-%015d", w.uploadDir, offset, endOffset)
+
+	getBody := func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(data)), nil
+	}
+
+	opts := rest.Opts{
+		Method:        "PUT",
+		Path:          partRemote,
+		Body:          bytes.NewReader(data),
+		GetBody:       getBody,
+		NoResponse:    true,
+		ContentLength: &contentLength,
+		ContentType:   "application/x-www-form-urlencoded",
+		Options:       w.options,
+		RootURL:       w.fs.chunksUploadURL,
+	}
+	var resp *http.Response
+	err = w.fs.pacer.Call(func() (bool, error) {
+		resp, err = w.fs.srv.Call(ctx, &opts)
+		return w.fs.shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return -1, fmt.Errorf("uploading chunk %d failed: %w", chunkNumber, err)
+	}
+	return contentLength, nil
+}
+
+// Close assembles the uploaded chunks into the final file with a MOVE.
+func (w *chunkWriter) Close(ctx context.Context) error {
+	var resp *http.Response
+
+	// see https://docs.nextcloud.com/server/24/developer_manual/client_apis/WebDAV/chunking.html?highlight=chunk#assembling-the-chunks
+	opts := rest.Opts{
+		Method:     "MOVE",
+		Path:       path.Join(w.uploadDir, ".file"),
+		NoResponse: true,
+		Options:    w.options,
+		RootURL:    w.fs.chunksUploadURL,
+	}
+	destinationURL, err := rest.URLJoin(w.fs.endpoint, w.filePath)
+	if err != nil {
+		return fmt.Errorf("finalize chunked upload couldn't join URL: %w", err)
+	}
+	opts.ExtraHeaders = w.extraHeaders
+	opts.ExtraHeaders["Destination"] = destinationURL.String()
+	sleepTime := 5 * time.Second
+	wasLocked := false
+	err = w.fs.pacer.Call(func() (bool, error) {
+		resp, err = w.fs.srv.Call(ctx, &opts)
+		return w.fs.shouldRetryChunkMerge(ctx, resp, err, &sleepTime, &wasLocked)
+	})
+	if err != nil {
+		return fmt.Errorf("finalize chunked upload failed, destinationURL: \"%s\": %w", destinationURL, err)
+	}
+	return nil
+}
+
+// Abort removes the uploaded chunks from the upload directory.
+func (w *chunkWriter) Abort(ctx context.Context) error {
+	opts := rest.Opts{
+		Method:     "DELETE",
+		Path:       w.uploadDir + "/",
+		NoResponse: true,
+		RootURL:    w.fs.chunksUploadURL,
+	}
+	var resp *http.Response
+	err := w.fs.pacer.Call(func() (bool, error) {
+		var err error
+		resp, err = w.fs.srv.Call(ctx, &opts)
+		return w.fs.shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return fmt.Errorf("abort failed to delete upload directory: %w", err)
+	}
+	return nil
+}
+
+// OpenChunkWriter returns the chunk size and a ChunkWriter for a
+// nextcloud remote with chunking enabled.
+//
+// It creates the chunked upload directory (and purges any stale one)
+// ready for the chunks to be written in parallel.
+func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
+	o := &Object{
+		fs:     f,
+		remote: remote,
+	}
+
+	uploadDir, err := o.createChunksUploadDirectory(ctx)
+	if err != nil {
+		return info, nil, err
+	}
+
+	// Use the hinted chunk size if provided, otherwise the configured one.
+	chunkSize := int64(f.opt.ChunkSize)
+	for _, option := range options {
+		if x, ok := option.(*fs.ChunkOption); ok {
+			chunkSize = x.ChunkSize
+			break
+		}
+	}
+	if src.Size() != -1 && src.Size() < chunkSize {
+		chunkSize = src.Size()
+	}
+
+	info = fs.ChunkWriterInfo{
+		ChunkSize:   chunkSize,
+		Concurrency: 4,
+	}
+
+	writer = &chunkWriter{
+		fs:           f,
+		filePath:     o.filePath(),
+		uploadDir:    uploadDir,
+		chunkSize:    chunkSize,
+		extraHeaders: o.extraHeaders(ctx, src),
+		options:      options,
+	}
+	return info, writer, nil
+}
+
+var _ fs.OpenChunkWriter = (*Fs)(nil)
+var _ fs.ChunkWriter = (*chunkWriter)(nil)
 
 func (o *Object) purgeUploadedChunks(ctx context.Context, uploadDir string) error {
 	// clean the upload directory if it exists (this means that a previous try didn't clean up properly).
