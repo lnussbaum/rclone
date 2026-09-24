@@ -155,6 +155,24 @@ Set to 0 to disable chunked uploading.
 			Advanced: true,
 			Default:  10 * fs.Mebi, // Default NextCloud `max_chunk_size` is `10 MiB`. See https://github.com/nextcloud/server/blob/0447b53bda9fe95ea0cbed765aa332584605d652/apps/files/lib/App.php#L57
 		}, {
+			Name: "nextcloud_chunked_upload_v2",
+			Help: `Use the Nextcloud V2 (multipart) chunked upload protocol.
+
+Instead of uploading the chunks to the upload directory and having the
+server stream-reassemble them (V1), the V2 protocol uploads them as
+multipart parts and asks the object store to assemble them server-side.
+This avoids downloading and re-uploading the whole file during the merge.
+
+It is only supported when the Nextcloud server has a multipart-capable
+object store (S3 or Azure) and a distributed cache (Redis or Memcached)
+configured. When this option is enabled, rclone probes the server once to
+check it really supports V2 and errors if it does not.
+
+The V1 (streaming) protocol is used when this is disabled.
+`,
+			Advanced: true,
+			Default:  true,
+		}, {
 			Name:     "owncloud_exclude_shares",
 			Help:     "Exclude ownCloud shares",
 			Advanced: true,
@@ -203,6 +221,7 @@ type Options struct {
 	Headers            fs.CommaSepList      `config:"headers"`
 	PacerMinSleep      fs.Duration          `config:"pacer_min_sleep"`
 	ChunkSize          fs.SizeSuffix        `config:"nextcloud_chunk_size"`
+	ChunkedUploadV2    bool                 `config:"nextcloud_chunked_upload_v2"`
 	ExcludeShares      bool                 `config:"owncloud_exclude_shares"`
 	ExcludeMounts      bool                 `config:"owncloud_exclude_mounts"`
 	UnixSocket         string               `config:"unix_socket"`
@@ -211,30 +230,34 @@ type Options struct {
 
 // Fs represents a remote webdav
 type Fs struct {
-	name               string        // name of this remote
-	root               string        // the path we are working on
-	opt                Options       // parsed options
-	features           *fs.Features  // optional features
-	endpoint           *url.URL      // URL of the host
-	endpointURL        string        // endpoint as a string
-	srv                *rest.Client  // the connection to the server
-	pacer              *fs.Pacer     // pacer for API calls
-	precision          time.Duration // mod time precision
-	canStream          bool          // set if can stream
-	canTus             bool          // supports the TUS upload protocol
-	useOCMtime         bool          // set if can use X-OC-Mtime
-	propsetMtime       bool          // set if can use propset
-	retryWithZeroDepth bool          // some vendors (sharepoint) won't list files when Depth is 1 (our default)
-	checkBeforePurge   bool          // enables extra check that directory to purge really exists
-	hasOCMD5           bool          // set if can use owncloud style checksums for MD5
-	hasOCSHA1          bool          // set if can use owncloud style checksums for SHA1
-	hasMESHA1          bool          // set if can use fastmail style checksums for SHA1
-	useStandardProps   bool          // set if should use standard props for PROPFIND
-	ntlmAuthMu         sync.Mutex    // mutex to serialize NTLM auth roundtrips
-	chunksUploadURL    string        // upload URL for nextcloud chunked
-	canChunk           bool          // set if nextcloud and nextcloud_chunk_size is set
-	canRecalcHash      bool          // set if the server can recalculate checksums with PATCH (nextcloud)
-	authSingleflight   *singleflight.Group
+	name                   string        // name of this remote
+	root                   string        // the path we are working on
+	opt                    Options       // parsed options
+	features               *fs.Features  // optional features
+	endpoint               *url.URL      // URL of the host
+	endpointURL            string        // endpoint as a string
+	srv                    *rest.Client  // the connection to the server
+	pacer                  *fs.Pacer     // pacer for API calls
+	precision              time.Duration // mod time precision
+	canStream              bool          // set if can stream
+	canTus                 bool          // supports the TUS upload protocol
+	useOCMtime             bool          // set if can use X-OC-Mtime
+	propsetMtime           bool          // set if can use propset
+	retryWithZeroDepth     bool          // some vendors (sharepoint) won't list files when Depth is 1 (our default)
+	checkBeforePurge       bool          // enables extra check that directory to purge really exists
+	hasOCMD5               bool          // set if can use owncloud style checksums for MD5
+	hasOCSHA1              bool          // set if can use owncloud style checksums for SHA1
+	hasMESHA1              bool          // set if can use fastmail style checksums for SHA1
+	useStandardProps       bool          // set if should use standard props for PROPFIND
+	ntlmAuthMu             sync.Mutex    // mutex to serialize NTLM auth roundtrips
+	chunksUploadURL        string        // upload URL for nextcloud chunked
+	canChunk               bool          // set if nextcloud and nextcloud_chunk_size is set
+	chunkedUploadV2        bool          // set if using the nextcloud V2 (multipart) chunked upload protocol
+	chunkedUploadV2Wanted  bool          // set if the nextcloud V2 option was requested
+	chunkedUploadV2Checked bool          // set once the server's V2 support has been probed
+	chunkedUploadV2Mu      sync.Mutex    // guards the V2 probe
+	canRecalcHash          bool          // set if the server can recalculate checksums with PATCH (nextcloud)
+	authSingleflight       *singleflight.Group
 }
 
 // Object describes a webdav object
@@ -683,10 +706,15 @@ func (f *Fs) setQuirks(ctx context.Context, vendor string) error {
 			}
 
 			f.chunksUploadURL = chunksUploadURL
+			f.chunkedUploadV2Wanted = f.opt.ChunkedUploadV2
 			// Enable parallel (multi-thread) chunked uploads. rclone's
 			// multi-thread copy machinery uploads the chunks concurrently
 			// and then calls Close to assemble them.
 			f.features.OpenChunkWriter = f.OpenChunkWriter
+			// The chunkWriter buffers each chunk in memory so it can be
+			// replayed on retry, so tell the machinery it doesn't need to
+			// pre-buffer the chunk too, halving peak memory.
+			f.features.ChunkWriterDoesntSeek = true
 			fs.Debugf(nil, "Chunks temporary upload directory: %s", f.chunksUploadURL)
 		}
 	case "sharepoint":
